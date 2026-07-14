@@ -165,7 +165,7 @@ pyinstaller --noconfirm --onefile --windowed \
 ---
 
 ## License
-No license is set yet — add one (e.g. MIT) before distributing.
+Released under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
 
 ---
 
