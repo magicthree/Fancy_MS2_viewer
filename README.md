@@ -20,28 +20,14 @@
 
 ---
 
-## Screenshots
+## Screenshot
 
-**Main window** — spectrum list, interactive stick plot, and metadata panel:
+The main window — spectrum list, interactive stick plot, and metadata panel.
+Here a **2.98 GB Bruker timsTOF `.mzML`** (165,768 scans → **155,568 MS2**, MS1
+skipped) has streamed in about **18 s**, and the **m/z filter** has narrowed it
+to the **29** precursors matching **653.681 ± 10 ppm**:
 
-![Main window](screenshots/01_main.png)
-
-**Search & m/z filter** — compute a target m/z from a chemical formula + adduct
-(monoisotopic mass) and filter by precursor or fragment within a tolerance:
-
-![Search and m/z filter](screenshots/02_search_mzfilter.png)
-
-**Custom colours** — build a single colour or a multi-stop gradient with
-adjustable stop positions, with a built-in colour palette:
-
-<p>
-  <img src="screenshots/03_custom_gradient.png" width="49%" alt="Gradient editor">
-  <img src="screenshots/04_color_wheel.png" width="42%" alt="Colour picker">
-</p>
-
-**Export** — high-resolution raster (PNG) or true **vector PDF**:
-
-![Export example](screenshots/05_export_example.png)
+![Main window with m/z filter on real data](figures/01_search_653p681_10ppm.png)
 
 ---
 
@@ -95,15 +81,6 @@ adjustable stop positions, with a built-in colour palette:
   a single `.msp`/`.mgf`.
 
 ---
-
-## Real-data example — filtering a 3 GB timsTOF file
-
-Loading a **2.98 GB Bruker timsTOF `.mzML`** (165,768 scans → **155,568 MS2**
-kept, MS1 skipped) streams in about **18 s** and stays fully interactive.
-Below, the **m/z filter** targets a precursor of **653.681 with a 10 ppm
-tolerance**, narrowing 155,568 spectra to the **29** matching precursors:
-
-![m/z 653.681 ± 10 ppm on real data](figures/01_search_653p681_10ppm.png)
 
 ## Colour & bar styling
 
