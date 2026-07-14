@@ -2,7 +2,7 @@
   <img src="icon.png" width="128" alt="FancyMS2viewer icon">
 </p>
 
-<h1 align="center">fancyMS2viewer</h1>
+<h1 align="center">FancyMS2Viewer</h1>
 
 <p align="center">
   A fast, lightweight desktop viewer for MS/MS (MS2) spectral libraries —
