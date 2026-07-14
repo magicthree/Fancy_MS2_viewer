@@ -528,11 +528,66 @@ class SpectrumPlot(tk.Canvas):
         self.scheme = DEFAULT_SCHEME   # peak colour scheme
         self.bar_width = 2       # stick thickness (px)
         self.transparency = 0    # 0 (opaque) .. 100 (invisible)
+        self.theme = BG_THEMES[DEFAULT_BG]   # background colour theme
+        self.precursor = None    # precursor m/z of current spectrum
+        self.limit_prec = False  # show only peaks <= precursor + 5
         self.on_context = None   # callback(event) for right-click menu
+
+        # current spectrum's metadata (for annotation value lookup)
+        self.meta = {}
+        self._name = ""
+        self._source = ""
+        self._num = 0
+
+        # metadata annotations on the plot (persist across spectra; positions
+        # are fractions of the canvas so they ignore zoom and window resize).
+        # Each: {field, fx, fy, size, show_field}.  "Name" is a special field.
+        self.annotations = [dict(field="Name", fx=0.5, fy=0.06, size=12,
+                                 show_field=False, bold=True, italic=False,
+                                 color="")]
+        self._annot_items = {}   # canvas item id -> annotation index
+        self._drag_annot = None
+        self._annot_off = (0, 0)
+        self._pan = None         # 'x' or 'y' while panning an axis
+        self._pan_start = None
+        self._base = 1.0         # fixed intensity reference (no y rescale)
+        self._xtitle_item = None  # canvas ids of axis-title text (for dblclick)
+        self._ytitle_item = None
+
+        # axis / label styling (configured from a separate menu)
+        self.show_xticks = True
+        self.show_yticks = True
+        self.show_titles = True        # axis titles (m/z, intensity)
+        self.show_peaklabels = True    # per-peak m/z labels
+        self.peaklabel_auto = True     # auto count by spacing (else fixed n)
+        self.peaklabel_n = 10
+        self.axis_fontsize = 8         # tick-label font
+        self.peaklabel_fontsize = 8
+        self.xtitle = ""               # custom x-axis title ("" = auto m/z)
+        self.ytitle = ""               # custom y-axis title ("" = auto)
+        # X and Y axis titles are styled independently
+        self.xtitle_fontsize = 9
+        self.ytitle_fontsize = 9
+        self.xtitle_bold = False
+        self.xtitle_italic = False
+        self.ytitle_bold = False
+        self.ytitle_italic = False
+        self.tick_bold = False
+        self.tick_italic = False
+        self.peaklabel_bold = False
+        self.peaklabel_italic = False
+        # per-element text colour overrides ("" = use the background theme)
+        self.tick_color = ""
+        self.xtitle_color = ""
+        self.ytitle_color = ""
+        self.peaklabel_color = ""
+        self._dlg = None               # single open plot dialog
         self.view_min = None     # current x (m/z) view window
         self.view_max = None
         self._full_min = None
         self._full_max = None
+        self.y_lo = 0.0          # current y view window, as a fraction of base
+        self.y_hi = 1.0
         self._drag_start = None
         self._drag_rect = None
         self._tip = None
@@ -543,25 +598,68 @@ class SpectrumPlot(tk.Canvas):
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Double-Button-1>", self._on_double)
         self.bind("<Button-3>", self._on_right_click)
         self.bind("<MouseWheel>", self._on_wheel)          # Windows / macOS
-        self.bind("<Button-4>", lambda e: self._zoom(0.8, e.x))  # Linux
-        self.bind("<Button-5>", lambda e: self._zoom(1.25, e.x))
+        self.bind("<Button-4>",
+                  lambda e: self._wheel_zoom(0.8, e.x, e.y, True))  # Linux
+        self.bind("<Button-5>",
+                  lambda e: self._wheel_zoom(1.25, e.x, e.y, False))
 
     # -- public API ---------------------------------------------------------
     def set_spectrum(self, spec):
         self.peaks = list(spec.peaks) if spec else []
         self.title = spec.name if spec else ""
+        self.precursor = _prec_float(spec) if spec else None
+        self.meta = dict(spec.meta) if spec else {}
+        self._name = spec.name if spec else ""
+        self._source = spec.source if spec else ""
+        self._num = spec.num if spec else 0
+        self._recompute_range()
+        self.y_lo, self.y_hi = 0.0, 1.0
+        self.redraw()
+
+    def annotation_value(self, ann):
+        """Text value of an annotation for the current spectrum ('' if none)."""
+        field = ann["field"]
+        if field == "Name":
+            v = self._name
+            return "" if v in ("", "(unnamed)") else v
+        return str(self.meta.get(field, ""))
+
+    def add_annotation(self, field, show_field=False):
+        n = len(self.annotations)
+        self.annotations.append(dict(
+            field=field, fx=0.5, fy=min(0.06 + 0.06 * n, 0.9),
+            size=12, show_field=show_field, bold=True, italic=False,
+            color=""))
+        self.redraw()
+
+    def clear_annotations(self):
+        self.annotations = []
+        self.redraw()
+
+    def _recompute_range(self):
+        """Set the full x range + fixed intensity base from the peaks.
+
+        The base (100 %% reference) is taken over the whole visible range so
+        that zooming in x does NOT rescale the y axis.
+        """
         if self.peaks:
             mzs = [p[0] for p in self.peaks]
             lo, hi = min(mzs), max(mzs)
+            if self.limit_prec and self.precursor is not None:
+                hi = min(hi, self.precursor + 5.0)
             span = max(hi - lo, 1.0)
             self._full_min = lo - span * 0.03
             self._full_max = hi + span * 0.03
+            in_range = [it for mz, it in self.peaks
+                        if self._full_min <= mz <= self._full_max]
+            self._base = max(in_range, default=1.0) or 1.0
         else:
             self._full_min, self._full_max = 0.0, 100.0
+            self._base = 1.0
         self.view_min, self.view_max = self._full_min, self._full_max
-        self.redraw()
 
     def set_relative(self, flag):
         self.relative = bool(flag)
@@ -571,20 +669,85 @@ class SpectrumPlot(tk.Canvas):
         self.scheme = scheme
         self.redraw()
 
+    def set_bg_theme(self, name):
+        self.theme = BG_THEMES.get(name, BG_THEMES[DEFAULT_BG])
+        self.configure(background=_hex(self.theme["bg"]))
+        self.redraw()
+
+    def set_limit_prec(self, flag):
+        self.limit_prec = bool(flag)
+        self._recompute_range()
+        self.redraw()
+
+    def set_axis_style(self, **kw):
+        for k, v in kw.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        self.redraw()
+
     def set_bar_style(self, width, transparency):
         self.bar_width = max(1, int(width))
         self.transparency = max(0, min(100, int(transparency)))
         self.redraw()
 
-    def reset_view(self):
+    def reset_x(self):
         self.view_min, self.view_max = self._full_min, self._full_max
         self.redraw()
 
+    def reset_y(self):
+        self.y_lo, self.y_hi = 0.0, 1.0
+        self.redraw()
+
+    def reset_view(self):
+        self.view_min, self.view_max = self._full_min, self._full_max
+        self.y_lo, self.y_hi = 0.0, 1.0
+        self.redraw()
+
     def _on_right_click(self, event):
+        idx = self._annot_at(event.x, event.y)
+        if idx is not None:
+            self._annotation_menu(event, idx)
+            return
         if self.on_context is not None:
             self.on_context(event)
         else:
             self.reset_view()
+
+    def _annotation_menu(self, event, idx):
+        a = self.annotations[idx]
+        m = tk.Menu(self, tearoff=0)
+        label = ("Show value only" if a.get("show_field")
+                 else "Show \"Field: value\"")
+
+        def toggle():
+            a["show_field"] = not a.get("show_field")
+            self.redraw()
+
+        def bigger():
+            a["size"] = min(60, int(a["size"]) + 2)
+            self.redraw()
+
+        def smaller():
+            a["size"] = max(6, int(a["size"]) - 2)
+            self.redraw()
+
+        def delete():
+            del self.annotations[idx]
+            self.redraw()
+
+        m.add_command(label=f"Label: {a['field']}", state="disabled")
+        m.add_separator()
+        m.add_command(label=label, command=toggle)
+        m.add_command(label="Set size…  (or double-click)",
+                      command=lambda: self._annotation_size_dialog(idx))
+        m.add_command(label="Bigger", command=bigger)
+        m.add_command(label="Smaller", command=smaller)
+        m.add_separator()
+        m.add_command(label="Delete label", command=delete)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
 
     # -- coordinate helpers -------------------------------------------------
     def _plot_area(self):
@@ -608,99 +771,165 @@ class SpectrumPlot(tk.Canvas):
             return lo
         return lo + (x - x0) / (x1 - x0) * (hi - lo)
 
+    def _frac_to_y(self, frac, y0, y1):
+        span = self.y_hi - self.y_lo
+        if span <= 0:
+            return y1
+        return y1 - (frac - self.y_lo) / span * (y1 - y0)
+
+    def _y_to_frac(self, py, y0, y1):
+        if y1 <= y0:
+            return self.y_lo
+        py = min(max(py, y0), y1)
+        return self.y_lo + (y1 - py) / (y1 - y0) * (self.y_hi - self.y_lo)
+
     # -- drawing ------------------------------------------------------------
     def redraw(self):
         self.delete("all")
+        self._xtitle_item = self._ytitle_item = None
         w = self.winfo_width()
         h = self.winfo_height()
         if w < 120 or h < 90:
             return
         x0, y0, x1, y1 = self._plot_area()
+        axis_c = _hex(self.theme["axis"])
 
         # axes
-        self.create_line(x0, y1, x1, y1, fill="#444")   # x axis
-        self.create_line(x0, y0, x0, y1, fill="#444")   # y axis
+        self.create_line(x0, y1, x1, y1, fill=axis_c)   # x axis
+        self.create_line(x0, y0, x0, y1, fill=axis_c)   # y axis
 
         if not self.peaks:
             self.create_text((x0 + x1) / 2, (y0 + y1) / 2,
                              text="No peaks to display",
-                             fill="#999", font=("Arial", 11))
+                             fill=_hex(self.theme["text"]), font=("Arial", 11))
             return
 
-        # peaks within current view
+        # peaks within current view; y uses a FIXED base (no rescale on zoom)
         vis = [(mz, it) for (mz, it) in self.peaks
                if self.view_min <= mz <= self.view_max]
-        if vis:
-            base = max(it for _, it in vis)
-        else:
-            base = max((it for _, it in self.peaks), default=1.0)
-        if base <= 0:
-            base = 1.0
-
-        # title (Microsoft YaHei UI when it contains Chinese, else Arial)
-        title_family = UI_FONT if _has_cjk(self.title) else "Arial"
-        self.create_text(x0, 14, anchor="w", text=self.title,
-                         fill="#222", font=(title_family, 10, "bold"))
+        base = self._base if self._base > 0 else 1.0
 
         # y grid + labels
         self._draw_y_axis(x0, y0, x1, y1, base)
         # x ticks
         self._draw_x_axis(x0, y0, x1, y1)
 
-        # sticks (coloured by scheme; thickness + transparency configurable)
+        # sticks (coloured by scheme; thickness + transparency configurable;
+        # clipped to the current y view window)
         for mz, it in vis:
-            x = self._mz_to_x(mz, x0, x1)
             frac = it / base
-            y = y1 - frac * (y1 - y0)
+            if frac <= self.y_lo:          # top is below the visible band
+                continue
+            x = self._mz_to_x(mz, x0, x1)
+            y = self._frac_to_y(min(frac, self.y_hi), y0, y1)
             color = _blend_white(scheme_color(self.scheme, frac),
                                  self.transparency)
             self.create_line(x, y1, x, y, fill=_hex(color),
                              width=self.bar_width)
 
-        # label the tallest peaks
-        vis_sorted = sorted(vis, key=lambda p: p[1], reverse=True)[:8]
-        for mz, it in vis_sorted:
-            x = self._mz_to_x(mz, x0, x1)
-            frac = it / base
-            y = y1 - frac * (y1 - y0)
-            self.create_text(x, y - 6, text=f"{mz:.4f}".rstrip("0").rstrip("."),
-                             anchor="s", fill="#c0392b",
-                             font=("Arial", 8))
+        # peak m/z labels: auto (by spacing) or a fixed count
+        if self.show_peaklabels:
+            cand = sorted((p for p in vis if p[1] / base > self.y_lo),
+                          key=lambda p: p[1], reverse=True)
+            placed = []
+            for mz, it in cand:
+                x = self._mz_to_x(mz, x0, x1)
+                if self.peaklabel_auto:
+                    if any(abs(x - px) < 42 for px in placed):
+                        continue
+                elif len(placed) >= max(0, self.peaklabel_n):
+                    break
+                placed.append(x)
+                frac = it / base
+                y = self._frac_to_y(min(frac, self.y_hi), y0, y1)
+                self.create_text(
+                    x, y - 6, text=f"{mz:.4f}".rstrip("0").rstrip("."),
+                    anchor="s",
+                    fill=self.peaklabel_color or _hex(self.theme["label"]),
+                    font=("Arial", self.peaklabel_fontsize,
+                          _tk_fontstyle(self.peaklabel_bold,
+                                        self.peaklabel_italic)))
+
+        # metadata annotations (draggable, fixed under zoom)
+        self._draw_annotations(w, h)
+
+    def _draw_annotations(self, w, h):
+        self._annot_items = {}
+        default = _hex(self.theme["title"])
+        for idx, a in enumerate(self.annotations):
+            val = self.annotation_value(a)
+            text = f"{a['field']}: {val}" if a.get("show_field") else val
+            if not text.strip():
+                continue
+            fam = UI_FONT if _has_cjk(text) else "Arial"
+            style = _tk_fontstyle(a.get("bold", True), a.get("italic", False))
+            item = self.create_text(
+                a["fx"] * w, a["fy"] * h, text=text, anchor="center",
+                fill=a.get("color") or default,
+                font=(fam, int(a["size"]), style), tags=("annot",))
+            self._annot_items[item] = idx
+
+    def _annot_at(self, x, y):
+        for item in reversed(self.find_overlapping(x - 2, y - 2, x + 2, y + 2)):
+            if item in self._annot_items:
+                return self._annot_items[item]
+        return None
 
     def _draw_y_axis(self, x0, y0, x1, y1, base):
-        for i in range(0, 6):
-            frac = i / 5.0
-            y = y1 - frac * (y1 - y0)
-            self.create_line(x0 - 4, y, x0, y, fill="#444")
-            if self.relative:
-                label = f"{frac * 100:.0f}%"
-            else:
-                label = _fmt_si(frac * base)
-            self.create_text(x0 - 8, y, anchor="e", text=label,
-                             fill="#555", font=("Arial", 8))
-        # axis title
-        self.create_text(16, (y0 + y1) / 2, angle=90,
-                         text="Relative intensity" if self.relative
-                         else "Intensity",
-                         fill="#555", font=("Arial", 8))
+        axis_c = _hex(self.theme["axis"])
+        text_c = _hex(self.theme["text"])
+        tick_c = self.tick_color or text_c
+        title_c = self.ytitle_color or text_c
+        tick_style = _tk_fontstyle(self.tick_bold, self.tick_italic)
+        title_style = _tk_fontstyle(self.ytitle_bold, self.ytitle_italic)
+        if self.show_yticks:
+            for i in range(0, 6):
+                frac = self.y_lo + (i / 5.0) * (self.y_hi - self.y_lo)
+                y = self._frac_to_y(frac, y0, y1)
+                self.create_line(x0 - 4, y, x0, y, fill=axis_c)
+                if self.relative:
+                    label = f"{frac * 100:.0f}%"
+                else:
+                    label = _fmt_si(frac * base)
+                self.create_text(x0 - 8, y, anchor="e", text=label,
+                                 fill=tick_c,
+                                 font=("Arial", self.axis_fontsize,
+                                       tick_style))
+        if self.show_titles:
+            ytitle = self.ytitle or ("Relative intensity" if self.relative
+                                     else "Intensity")
+            self._ytitle_item = self.create_text(
+                16, (y0 + y1) / 2, angle=90, text=ytitle, fill=title_c,
+                font=("Arial", self.ytitle_fontsize, title_style),
+                tags=("ytitle",))
 
     def _draw_x_axis(self, x0, y0, x1, y1):
+        axis_c = _hex(self.theme["axis"])
+        text_c = _hex(self.theme["text"])
+        tick_c = self.tick_color or text_c
+        title_c = self.xtitle_color or text_c
+        tick_style = _tk_fontstyle(self.tick_bold, self.tick_italic)
+        title_style = _tk_fontstyle(self.xtitle_bold, self.xtitle_italic)
         lo, hi = self.view_min, self.view_max
         span = hi - lo
         if span <= 0:
             return
-        step = _nice_step(span / 8.0)
-        start = (int(lo / step) + 1) * step
-        v = start
-        while v < hi:
-            x = self._mz_to_x(v, x0, x1)
-            self.create_line(x, y1, x, y1 + 4, fill="#444")
-            self.create_text(x, y1 + 7, anchor="n",
-                             text=f"{v:g}", fill="#555",
-                             font=("Arial", 8))
-            v += step
-        self.create_text((x0 + x1) / 2, y1 + 30, text="m/z",
-                         fill="#555", font=("Arial", 9))
+        if self.show_xticks:
+            step = _nice_step(span / 8.0)
+            v = (int(lo / step) + 1) * step
+            while v < hi:
+                x = self._mz_to_x(v, x0, x1)
+                self.create_line(x, y1, x, y1 + 4, fill=axis_c)
+                self.create_text(x, y1 + 7, anchor="n", text=f"{v:g}",
+                                 fill=tick_c,
+                                 font=("Arial", self.axis_fontsize,
+                                       tick_style))
+                v += step
+        if self.show_titles:
+            self._xtitle_item = self.create_text(
+                (x0 + x1) / 2, y1 + 30, text=self.xtitle or "m/z",
+                fill=title_c, font=("Arial", self.xtitle_fontsize, title_style),
+                tags=("xtitle",))
 
     # -- interaction --------------------------------------------------------
     def _nearest_peak(self, px, py):
@@ -747,49 +976,320 @@ class SpectrumPlot(tk.Canvas):
         self._tip = None
 
     def _on_press(self, e):
-        self._drag_start = e.x
+        idx = self._annot_at(e.x, e.y)
+        if idx is not None:                    # start moving an annotation
+            self._drag_annot = idx
+            w, h = self.winfo_width(), self.winfo_height()
+            a = self.annotations[idx]
+            self._annot_off = (e.x - a["fx"] * w, e.y - a["fy"] * h)
+            return
+        x0, y0, x1, y1 = self._plot_area()
+        # dragging on an axis pans it (useful after zoom)
+        if e.x <= x0 and y0 <= e.y <= y1:
+            self._pan = "y"
+            self._pan_start = (e.x, e.y, self.y_lo, self.y_hi)
+            return
+        if e.y >= y1 and x0 <= e.x <= x1:
+            self._pan = "x"
+            self._pan_start = (e.x, e.y, self.view_min, self.view_max)
+            return
+        self._drag_start = (e.x, e.y)
 
     def _on_drag(self, e):
+        if self._drag_annot is not None:
+            w = max(self.winfo_width(), 1)
+            h = max(self.winfo_height(), 1)
+            ox, oy = self._annot_off
+            a = self.annotations[self._drag_annot]
+            a["fx"] = min(max((e.x - ox) / w, 0.0), 1.0)
+            a["fy"] = min(max((e.y - oy) / h, 0.0), 1.0)
+            self.redraw()
+            return
+        if self._pan is not None:
+            self._do_pan(e)
+            return
         if self._drag_start is None:
             return
         if self._drag_rect:
             self.delete(self._drag_rect)
         x0, y0, x1, y1 = self._plot_area()
+        ax, ay = self._drag_start
         self._drag_rect = self.create_rectangle(
-            self._drag_start, y0, e.x, y1,
+            ax, ay, e.x, e.y,
             outline="#3498db", fill="#3498db", stipple="gray25")
 
+    def _do_pan(self, e):
+        x0, y0, x1, y1 = self._plot_area()
+        sx, sy, a, b = self._pan_start
+        if self._pan == "x":
+            span = b - a
+            dmz = -(e.x - sx) / max(x1 - x0, 1) * span
+            lo, hi = a + dmz, b + dmz
+            if lo < self._full_min:
+                lo, hi = self._full_min, self._full_min + span
+            if hi > self._full_max:
+                lo, hi = self._full_max - span, self._full_max
+            self.view_min, self.view_max = lo, hi
+        else:
+            span = b - a
+            dfr = (e.y - sy) / max(y1 - y0, 1) * span
+            lo, hi = a + dfr, b + dfr
+            if lo < 0.0:
+                lo, hi = 0.0, span
+            if hi > 1.0:
+                lo, hi = 1.0 - span, 1.0
+            self.y_lo, self.y_hi = lo, hi
+        self.redraw()
+
     def _on_release(self, e):
+        if self._drag_annot is not None:
+            self._drag_annot = None
+            return
+        if self._pan is not None:
+            self._pan = None
+            return
         if self._drag_rect:
             self.delete(self._drag_rect)
             self._drag_rect = None
         if self._drag_start is None:
             return
         x0, y0, x1, y1 = self._plot_area()
-        a, b = self._drag_start, e.x
+        ax, ay = self._drag_start
+        bx, by = e.x, e.y
         self._drag_start = None
-        if abs(b - a) < 6:      # treat as click, not a zoom
+        # A drag wide enough zooms x; tall enough zooms y; a box does both.
+        # (horizontal drag → x only, vertical drag → y only, box → both)
+        if abs(bx - ax) < 6 and abs(by - ay) < 6:
+            return                       # treat as a click
+        if abs(bx - ax) >= 6:
+            lo = self._x_to_mz(min(ax, bx), x0, x1)
+            hi = self._x_to_mz(max(ax, bx), x0, x1)
+            if hi - lo > 1e-6:
+                self.view_min, self.view_max = lo, hi
+        if abs(by - ay) >= 6:
+            f1 = self._y_to_frac(ay, y0, y1)
+            f2 = self._y_to_frac(by, y0, y1)
+            lo, hi = max(0.0, min(f1, f2)), min(1.0, max(f1, f2))
+            if hi - lo > 0.005:
+                self.y_lo, self.y_hi = lo, hi
+        self.redraw()
+
+    def _title_at(self, x, y):
+        items = self.find_overlapping(x - 2, y - 2, x + 2, y + 2)
+        if self._xtitle_item in items:
+            return "x"
+        if self._ytitle_item in items:
+            return "y"
+        return None
+
+    def _on_double(self, e):
+        idx = self._annot_at(e.x, e.y)
+        if idx is not None:                    # double-click a label → size box
+            self._annotation_size_dialog(idx)
             return
-        lo = self._x_to_mz(min(a, b), x0, x1)
-        hi = self._x_to_mz(max(a, b), x0, x1)
-        if hi - lo > 1e-6:
-            self.view_min, self.view_max = lo, hi
+        which = self._title_at(e.x, e.y)
+        if which:                              # double-click axis title → edit
+            self._axis_title_dialog(which)
+            return
+        x0, y0, x1, y1 = self._plot_area()
+        px, py = e.x, e.y
+        if x0 < px < x1 and y0 < py < y1:      # inside plot → reset both
+            self.reset_view()
+        elif px <= x0 and y0 - 6 <= py <= y1 + 6:   # on the y axis
+            self.reset_y()
+        elif py >= y1 and x0 - 6 <= px <= x1 + 6:   # on the x axis
+            self.reset_x()
+        else:
+            self.reset_view()
+
+    def _open_dialog(self, title):
+        """Create a single, centered, modal dialog (freezes other windows)."""
+        if self._dlg is not None and self._dlg.winfo_exists():
+            self._dlg.lift()
+            return None
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.transient(self.winfo_toplevel())
+        dlg.resizable(False, False)
+        self._dlg = dlg
+        return dlg
+
+    def _finish_dialog(self, dlg):
+        """Centre the dialog on the main window and grab focus (modal)."""
+        dlg.update_idletasks()
+        root = self.winfo_toplevel()
+        x = root.winfo_rootx() + (root.winfo_width() - dlg.winfo_width()) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        try:
+            dlg.grab_set()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _annotation_size_dialog(self, idx):
+        a = self.annotations[idx]
+        dlg = self._open_dialog("Label size")
+        if dlg is None:
+            return
+        size = tk.IntVar(value=int(a["size"]))
+        bold = tk.BooleanVar(value=a.get("bold", True))
+        italic = tk.BooleanVar(value=a.get("italic", False))
+        color = tk.StringVar(value=a.get("color", ""))
+
+        def apply(*_a):
+            try:
+                v = int(float(size.get()))
+            except (ValueError, tk.TclError):
+                return
+            a["size"] = max(6, min(72, v))
+            a["bold"] = bold.get()
+            a["italic"] = italic.get()
+            a["color"] = color.get()
             self.redraw()
+
+        top = ttk.Frame(dlg)
+        top.pack(padx=14, pady=(14, 4))
+        ttk.Label(top, text=f"“{a['field']}”  font size (px):").pack(
+            side="left")
+        sp = tk.Spinbox(top, from_=6, to=72, width=5, textvariable=size,
+                        command=apply)
+        sp.pack(side="left", padx=(6, 0))
+        sp.bind("<KeyRelease>", apply)
+        tk.Scale(dlg, from_=6, to=72, orient="horizontal", length=240,
+                 variable=size, command=apply).pack(padx=14)
+        sty = ttk.Frame(dlg)
+        sty.pack(padx=14, pady=(2, 0), anchor="w")
+        ttk.Checkbutton(sty, text="Bold", variable=bold,
+                        command=apply).pack(side="left")
+        ttk.Checkbutton(sty, text="Italic", variable=italic,
+                        command=apply).pack(side="left", padx=(10, 0))
+        _color_row(dlg, "Colour", color, self.theme["title"],
+                   self.winfo_toplevel()._pick_color, apply).pack(
+            anchor="w", padx=14, pady=(4, 0))
+        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(
+            anchor="e", padx=14, pady=(6, 14))
+        self._finish_dialog(dlg)
+
+    def _axis_title_dialog(self, which):
+        default = "m/z" if which == "x" else (
+            "Relative intensity" if self.relative else "Intensity")
+        cur = self.xtitle if which == "x" else self.ytitle
+        dlg = self._open_dialog(f"{which.upper()}-axis title")
+        if dlg is None:
+            return
+        is_x = which == "x"
+        var = tk.StringVar(value=cur)
+        fsize = tk.IntVar(value=int(self.xtitle_fontsize if is_x
+                                    else self.ytitle_fontsize))
+        bold = tk.BooleanVar(value=self.xtitle_bold if is_x
+                             else self.ytitle_bold)
+        italic = tk.BooleanVar(value=self.xtitle_italic if is_x
+                               else self.ytitle_italic)
+        color = tk.StringVar(value=self.xtitle_color if is_x
+                             else self.ytitle_color)
+
+        def apply(*_a):
+            try:
+                fs = max(5, min(40, int(fsize.get())))
+            except (ValueError, tk.TclError):
+                fs = None
+            if is_x:
+                self.xtitle = var.get()
+                if fs:
+                    self.xtitle_fontsize = fs
+                self.xtitle_bold = bold.get()
+                self.xtitle_italic = italic.get()
+                self.xtitle_color = color.get()
+            else:
+                self.ytitle = var.get()
+                if fs:
+                    self.ytitle_fontsize = fs
+                self.ytitle_bold = bold.get()
+                self.ytitle_italic = italic.get()
+                self.ytitle_color = color.get()
+            self.redraw()
+
+        ttk.Label(dlg, text=f"{which.upper()}-axis title "
+                            f"(blank = “{default}”):").pack(
+            anchor="w", padx=14, pady=(14, 4))
+        ent = ttk.Entry(dlg, textvariable=var, width=34)
+        ent.pack(padx=14)
+        ent.bind("<KeyRelease>", apply)
+        ent.focus_set()
+        row = ttk.Frame(dlg)
+        row.pack(anchor="w", padx=14, pady=(8, 2))
+        ttk.Label(row, text="Font size (px):").pack(side="left")
+        sp = tk.Spinbox(row, from_=5, to=40, width=5, textvariable=fsize,
+                        command=apply)
+        sp.pack(side="left", padx=(6, 0))
+        sp.bind("<KeyRelease>", apply)
+        tk.Scale(dlg, from_=5, to=40, orient="horizontal", length=240,
+                 variable=fsize, command=apply).pack(padx=14)
+        sty = ttk.Frame(dlg)
+        sty.pack(anchor="w", padx=14, pady=(2, 0))
+        ttk.Checkbutton(sty, text="Bold", variable=bold,
+                        command=apply).pack(side="left")
+        ttk.Checkbutton(sty, text="Italic", variable=italic,
+                        command=apply).pack(side="left", padx=(10, 0))
+        _color_row(dlg, "Colour", color, self.theme["text"],
+                   self.winfo_toplevel()._pick_color, apply).pack(
+            anchor="w", padx=14, pady=(4, 0))
+        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(
+            anchor="e", padx=14, pady=(6, 14))
+        self._finish_dialog(dlg)
 
     def _on_wheel(self, e):
         factor = 0.8 if e.delta > 0 else 1.25
-        self._zoom(factor, e.x)
+        self._wheel_zoom(factor, e.x, e.y, up=(e.delta > 0))
 
-    def _zoom(self, factor, px):
+    def _wheel_zoom(self, factor, px, py, up=True):
+        idx = self._annot_at(px, py)
+        if idx is not None:                    # resize the label under cursor
+            a = self.annotations[idx]
+            a["size"] = min(60, max(6, int(a["size"]) + (1 if up else -1)))
+            self.redraw()
+            return
         x0, y0, x1, y1 = self._plot_area()
-        center = self._x_to_mz(px, x0, x1)
+        if px < x0:                # over the y-axis area → zoom y
+            self._zoom_y(factor, py)
+        else:                      # otherwise zoom x
+            self._zoom_x(factor, px)
+
+    # If the cursor is within this fraction of an axis end, pin that end.
+    EDGE_ANCHOR = 0.15
+
+    def _zoom_x(self, factor, px):
+        x0, y0, x1, y1 = self._plot_area()
+        t = (px - x0) / max(x1 - x0, 1)
+        if t <= self.EDGE_ANCHOR:          # near left end → pin view_min
+            center = self.view_min
+        elif t >= 1 - self.EDGE_ANCHOR:    # near right end → pin view_max
+            center = self.view_max
+        else:
+            center = self._x_to_mz(px, x0, x1)
         lo = center - (center - self.view_min) * factor
         hi = center + (self.view_max - center) * factor
-        # clamp to full range
         lo = max(lo, self._full_min)
         hi = min(hi, self._full_max)
         if hi - lo > 1e-6:
             self.view_min, self.view_max = lo, hi
+            self.redraw()
+
+    def _zoom_y(self, factor, py):
+        x0, y0, x1, y1 = self._plot_area()
+        t = (py - y0) / max(y1 - y0, 1)    # 0 at top (y_hi), 1 at bottom (y_lo)
+        if t <= self.EDGE_ANCHOR:          # near top → pin y_hi
+            center = self.y_hi
+        elif t >= 1 - self.EDGE_ANCHOR:    # near bottom → pin y_lo (baseline)
+            center = self.y_lo
+        else:
+            center = self._y_to_frac(py, y0, y1)
+        lo = center - (center - self.y_lo) * factor
+        hi = center + (self.y_hi - center) * factor
+        lo = max(0.0, lo)
+        hi = min(1.0, hi)
+        if hi - lo > 0.005:
+            self.y_lo, self.y_hi = lo, hi
             self.redraw()
 
 
@@ -839,24 +1339,15 @@ _ELEMENT_MASS = {
 _ELECTRON_MASS = 0.00054857990907
 
 # adduct: label -> (M multiplier, add formula, remove formula, signed charge)
-ADDUCTS = {
-    "[M+H]+": (1, "H", "", 1),
-    "[M+Na]+": (1, "Na", "", 1),
-    "[M+K]+": (1, "K", "", 1),
-    "[M+NH4]+": (1, "NH4", "", 1),
-    "[M+H-H2O]+": (1, "H", "H2O", 1),
-    "[M+2H]2+": (1, "H2", "", 2),
-    "[M+3H]3+": (1, "H3", "", 3),
-    "[2M+H]+": (2, "H", "", 1),
-    "[M]+": (1, "", "", 1),
-    "[M-H]-": (1, "", "H", -1),
-    "[M+Cl]-": (1, "Cl", "", -1),
-    "[M+HCOO]-": (1, "CHO2", "", -1),
-    "[M+CH3COO]-": (1, "C2H3O2", "", -1),
-    "[M-2H]2-": (1, "", "H2", -2),
-    "[2M-H]-": (2, "", "H", -1),
-    "[M]-": (1, "", "", -1),
-}
+# Preset adduct labels for the dropdown. Any label in the general form
+# [<n>M ±A ±B …]<z><sign> also works when typed in by hand (custom adducts).
+ADDUCT_PRESETS = [
+    "[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+H-H2O]+",
+    "[M+2H]2+", "[M+3H]3+", "[M+2NH4]2+", "[M+H+NH4]2+", "[2M+H]+",
+    "[2M+Na]+", "[2M+NH4]+", "[M]+",
+    "[M-H]-", "[M+Cl]-", "[M+HCOO]-", "[M+CH3COO]-",
+    "[M-2H]2-", "[2M-H]-", "[M]-",
+]
 
 _FORMULA_TOKEN = re.compile(r"[A-Z][a-z]?|\(|\)|\d+")
 
@@ -908,14 +1399,53 @@ def formula_mass(formula):
     return total
 
 
+_ADDUCT_TERM = re.compile(r"([+-])(\d*)([A-Za-z][A-Za-z0-9]*)")
+
+
+def parse_adduct(adduct):
+    """Parse an adduct label like [2M+H]+, [M+2NH4]2+, [M+H-H2O]+.
+
+    Returns (M-multiplier, added mass, removed mass, signed charge).
+    Accepts ']' or '}' as the closing bracket and the charge either before or
+    after the sign (2+ or +2).
+    """
+    s = adduct.strip().replace(" ", "")
+    if not s.startswith("["):
+        raise ValueError(f"Adduct must start with '[': {adduct!r}")
+    close = max(s.find("]"), s.find("}"))
+    if close < 0:
+        raise ValueError(f"Adduct missing ']': {adduct!r}")
+    core, chg = s[1:close], s[close + 1:]
+    if "+" in chg:
+        sign = 1
+    elif "-" in chg:
+        sign = -1
+    else:
+        raise ValueError(f"Adduct needs a charge sign: {adduct!r}")
+    digits = "".join(c for c in chg if c.isdigit())
+    z = sign * (int(digits) if digits else 1)
+
+    cm = re.match(r"^(\d*)M(.*)$", core)
+    if not cm:
+        raise ValueError(f"Adduct must contain 'M': {adduct!r}")
+    mult = int(cm.group(1)) if cm.group(1) else 1
+    rest = cm.group(2)
+    if rest and not re.fullmatch(r"([+-]\d*[A-Za-z][A-Za-z0-9]*)+", rest):
+        raise ValueError(f"Cannot parse adduct: {adduct!r}")
+    add = rem = 0.0
+    for op, cnt, frm in _ADDUCT_TERM.findall(rest):
+        mass = (int(cnt) if cnt else 1) * formula_mass(frm)
+        if op == "+":
+            add += mass
+        else:
+            rem += mass
+    return mult, add, rem, z
+
+
 def adduct_mz(neutral_mass, adduct):
-    """m/z for a neutral monoisotopic mass under the given adduct."""
-    mult, add_f, rem_f, z = ADDUCTS[adduct]
-    m = neutral_mass * mult
-    if add_f:
-        m += formula_mass(add_f)
-    if rem_f:
-        m -= formula_mass(rem_f)
+    """m/z for a neutral monoisotopic mass under the given adduct label."""
+    mult, add, rem, z = parse_adduct(adduct)
+    m = neutral_mass * mult + add - rem
     # positive charge removes electrons, negative charge adds them
     m -= z * _ELECTRON_MASS
     return m / abs(z)
@@ -1059,6 +1589,69 @@ def _hex(rgb):
     return "#%02x%02x%02x" % rgb
 
 
+def _hex_to_rgb(s):
+    s = s.lstrip("#")
+    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+
+
+def _color_row(parent, label, var, default_rgb, pick, on_change):
+    """A label + swatch + 'Colour…' / 'Default' row bound to a hex StringVar.
+
+    An empty var means 'use the theme default' (default_rgb).
+    """
+    row = ttk.Frame(parent)
+    swatch = tk.Label(row, width=3, relief="solid", borderwidth=1)
+
+    def refresh():
+        swatch.configure(background=var.get() or _hex(default_rgb))
+
+    def choose():
+        cur = var.get() or _hex(default_rgb)
+        rgb = pick(_hex_to_rgb(cur))
+        if rgb:
+            var.set(_hex(rgb))
+            refresh()
+            on_change()
+
+    def clear():
+        var.set("")
+        refresh()
+        on_change()
+
+    ttk.Label(row, text=label, width=12).pack(side="left")
+    swatch.pack(side="left", padx=(0, 6))
+    ttk.Button(row, text="Colour…", width=8, command=choose).pack(side="left")
+    ttk.Button(row, text="Default", width=8, command=clear).pack(
+        side="left", padx=(4, 0))
+    refresh()
+    return row
+
+
+# -- plot background themes (bg + matching axis/text/title/label colours) --- #
+BG_THEMES = {
+    "White": dict(bg=(255, 255, 255), axis=(68, 68, 68), text=(85, 85, 85),
+                  title=(17, 17, 17), label=(192, 60, 43)),
+    "Light grey": dict(bg=(244, 245, 247), axis=(90, 90, 90),
+                       text=(80, 80, 80), title=(20, 20, 20),
+                       label=(192, 60, 43)),
+    "Sepia": dict(bg=(247, 241, 227), axis=(120, 100, 70), text=(105, 88, 58),
+                  title=(60, 45, 20), label=(170, 60, 40)),
+    "Dark": dict(bg=(34, 38, 43), axis=(150, 150, 150), text=(200, 200, 200),
+                 title=(236, 236, 236), label=(255, 138, 128)),
+    "Black": dict(bg=(0, 0, 0), axis=(130, 130, 130), text=(190, 190, 190),
+                  title=(255, 255, 255), label=(255, 107, 107)),
+}
+DEFAULT_BG = "White"
+
+
+def _prec_float(spec):
+    """Precursor m/z of a spectrum as a float, or None."""
+    try:
+        return float(str(spec.precursor).split()[0])
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
 # -- fonts: Arial for Latin, Microsoft YaHei for CJK ------------------------ #
 
 def _resource_path(name):
@@ -1086,7 +1679,28 @@ ARIAL_PATH = _find_font("arial.ttf", "Arial.ttf", "DejaVuSans.ttf")
 YAHEI_PATH = _find_font("msyh.ttc", "msyh.ttf", "msyhl.ttc",
                         "SourceHanSansSC-Regular.otf",
                         "NotoSansCJK-Regular.ttc")
+# Latin bold / italic variants (fall back to the regular face if absent)
+ARIAL_BOLD = _find_font("arialbd.ttf", "DejaVuSans-Bold.ttf") or ARIAL_PATH
+ARIAL_ITALIC = _find_font("ariali.ttf", "DejaVuSans-Oblique.ttf") or ARIAL_PATH
+ARIAL_BOLDIT = _find_font("arialbi.ttf",
+                          "DejaVuSans-BoldOblique.ttf") or ARIAL_PATH
+YAHEI_BOLD = _find_font("msyhbd.ttc", "msyhbd.ttf") or YAHEI_PATH
 UI_FONT = "Microsoft YaHei UI" if _find_font("msyh.ttc") else "Arial"
+
+
+def _latin_font_path(bold, italic):
+    if bold and italic:
+        return ARIAL_BOLDIT
+    if bold:
+        return ARIAL_BOLD
+    if italic:
+        return ARIAL_ITALIC
+    return ARIAL_PATH
+
+
+def _tk_fontstyle(bold, italic):
+    s = ("bold " if bold else "") + ("italic" if italic else "")
+    return s.strip() or "normal"
 
 
 def _has_cjk(s):
@@ -1113,17 +1727,24 @@ class _PILBackend:
         self._Image = Image
         self._ImageDraw = ImageDraw
         self._ImageFont = ImageFont
+        self.w, self.h = width, height
         self.img = Image.new("RGB", (width, height), "white")
         self.dr = ImageDraw.Draw(self.img)
         self._cache = {}
 
-    def _f(self, size, cjk):
-        key = (size, cjk)
+    def fill_bg(self, rgb):
+        self.dr.rectangle([0, 0, self.w, self.h], fill=tuple(rgb))
+
+    def _f(self, size, cjk, bold=False, italic=False):
+        key = (size, cjk, bold, italic)
         if key in self._cache:
             return self._cache[key]
         ImageFont = self._ImageFont
         fnt = None
-        path = YAHEI_PATH if cjk else ARIAL_PATH
+        if cjk:
+            path = YAHEI_BOLD if bold else YAHEI_PATH
+        else:
+            path = _latin_font_path(bold, italic)
         if path:
             try:
                 if path.lower().endswith(".ttc"):
@@ -1147,8 +1768,9 @@ class _PILBackend:
     def line(self, x0, y0, x1, y1, rgb, width=1):
         self.dr.line([(x0, y0), (x1, y1)], fill=rgb, width=int(width))
 
-    def text(self, x, y, s, rgb, size=15, anchor="lt", rotate=0):
-        fnt = self._f(size, _has_cjk(s))
+    def text(self, x, y, s, rgb, size=15, anchor="lt", rotate=0,
+             bold=False, italic=False):
+        fnt = self._f(size, _has_cjk(s), bold, italic)
         if rotate:
             tw = int(self.dr.textlength(s, font=fnt))
             tmp = self._Image.new("RGBA", (tw + 4, size + 8), (0, 0, 0, 0))
@@ -1204,6 +1826,11 @@ class _PDFBackend:
         self.ops = []
         self.pages.append(self.ops)
 
+    def fill_bg(self, rgb):
+        r, g, b = (c / 255.0 for c in rgb)
+        self.ops.append(
+            f"{r:.3f} {g:.3f} {b:.3f} rg 0 0 {self.w} {self.h} re f")
+
     @staticmethod
     def _text_width(s, size):
         return sum(_HELV_W.get(ch, 556) for ch in s) / 1000.0 * size
@@ -1219,7 +1846,8 @@ class _PDFBackend:
     def _esc(s):
         return s.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
 
-    def text(self, x, y, s, rgb, size=15, anchor="lt", rotate=0):
+    def text(self, x, y, s, rgb, size=15, anchor="lt", rotate=0,
+             bold=False, italic=False):
         r, g, b = (c / 255.0 for c in rgb)
         Y = self.h
         tw = self._text_width(s, size)
@@ -1287,32 +1915,38 @@ class _PDFBackend:
             fh.write(out)
 
 
-_RL_STATE = {"ready": False, "arial": False, "yahei": False}
+_RL_STATE = {"ready": False, "arial": False, "yahei": False,
+             "arial_bd": False, "arial_it": False, "arial_bi": False,
+             "yahei_bd": False}
 
 
 def _ensure_rl_fonts():
-    """Register Arial + Microsoft YaHei with reportlab once (embeds subsets)."""
+    """Register Arial + Microsoft YaHei (with bold/italic variants) once."""
     if _RL_STATE["ready"]:
         return
     _RL_STATE["ready"] = True
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    if ARIAL_PATH:
+
+    def reg(name, path, key, idx=None):
+        if not path:
+            return
         try:
-            pdfmetrics.registerFont(TTFont("Arial", ARIAL_PATH))
-            _RL_STATE["arial"] = True
-        except Exception:  # noqa: BLE001
-            pass
-    if YAHEI_PATH:
-        try:
-            if YAHEI_PATH.lower().endswith(".ttc"):
-                pdfmetrics.registerFont(TTFont("YaHei", YAHEI_PATH,
-                                               subfontIndex=0))
+            if path.lower().endswith(".ttc"):
+                pdfmetrics.registerFont(TTFont(name, path,
+                                               subfontIndex=idx or 0))
             else:
-                pdfmetrics.registerFont(TTFont("YaHei", YAHEI_PATH))
-            _RL_STATE["yahei"] = True
+                pdfmetrics.registerFont(TTFont(name, path))
+            _RL_STATE[key] = True
         except Exception:  # noqa: BLE001
             pass
+
+    reg("Arial", ARIAL_PATH, "arial")
+    reg("Arial-Bold", ARIAL_BOLD, "arial_bd")
+    reg("Arial-Italic", ARIAL_ITALIC, "arial_it")
+    reg("Arial-BoldItalic", ARIAL_BOLDIT, "arial_bi")
+    reg("YaHei", YAHEI_PATH, "yahei")
+    reg("YaHei-Bold", YAHEI_BOLD, "yahei_bd")
 
 
 class _RLBackend:
@@ -1322,15 +1956,31 @@ class _RLBackend:
         from reportlab.pdfgen import canvas
         _ensure_rl_fonts()
         self.c = canvas.Canvas(path, pagesize=(width, height))
-        self.h = height
+        self.w, self.h = width, height
 
     def new_page(self):
         self.c.showPage()
 
-    def _font_for(self, s):
+    def fill_bg(self, rgb):
+        self.c.setFillColorRGB(*(v / 255.0 for v in rgb))
+        self.c.rect(0, 0, self.w, self.h, fill=1, stroke=0)
+
+    def _font_for(self, s, bold=False, italic=False):
         if _has_cjk(s) and _RL_STATE["yahei"]:
-            return "YaHei"
-        return "Arial" if _RL_STATE["arial"] else "Helvetica"
+            return "YaHei-Bold" if bold and _RL_STATE["yahei_bd"] else "YaHei"
+        if not _RL_STATE["arial"]:
+            # base-14 Helvetica variants
+            v = ("Helvetica-BoldOblique" if bold and italic else
+                 "Helvetica-Bold" if bold else
+                 "Helvetica-Oblique" if italic else "Helvetica")
+            return v
+        if bold and italic and _RL_STATE["arial_bi"]:
+            return "Arial-BoldItalic"
+        if bold and _RL_STATE["arial_bd"]:
+            return "Arial-Bold"
+        if italic and _RL_STATE["arial_it"]:
+            return "Arial-Italic"
+        return "Arial"
 
     def line(self, x0, y0, x1, y1, rgb, width=1):
         self.c.setStrokeColorRGB(*(v / 255.0 for v in rgb))
@@ -1338,9 +1988,10 @@ class _RLBackend:
         Y = self.h
         self.c.line(x0, Y - y0, x1, Y - y1)
 
-    def text(self, x, y, s, rgb, size=15, anchor="lt", rotate=0):
+    def text(self, x, y, s, rgb, size=15, anchor="lt", rotate=0,
+             bold=False, italic=False):
         self.c.setFillColorRGB(*(v / 255.0 for v in rgb))
-        font = self._font_for(s)
+        font = self._font_for(s, bold, italic)
         Y = self.h
         asc, cap = 0.718 * size, 0.70 * size
         vy = {"t": asc, "m": cap * 0.5, "b": 0.0}[anchor[1]]
@@ -1386,59 +2037,115 @@ def _blend_white(rgb, transparency):
     return tuple(int(round(c + (255 - c) * f)) for c in rgb)
 
 
+DEFAULT_STYLE = dict(show_xticks=True, show_yticks=True, show_titles=True,
+                     show_peaklabels=True, peaklabel_auto=True,
+                     peaklabel_n=10, xtitle="", ytitle="",
+                     axis_fontsize=8, xtitle_fontsize=9, ytitle_fontsize=9,
+                     peaklabel_fontsize=8,
+                     tick_bold=False, tick_italic=False,
+                     xtitle_bold=False, xtitle_italic=False,
+                     ytitle_bold=False, ytitle_italic=False,
+                     peaklabel_bold=False, peaklabel_italic=False,
+                     tick_color="", xtitle_color="", ytitle_color="",
+                     peaklabel_color="")
+
+
+def _annotation_value(spec, field):
+    if field == "Name":
+        v = spec.name
+        return "" if v in ("", "(unnamed)") else v
+    return str(spec.meta.get(field, ""))
+
+
 def _draw_spectrum(be, width, height, spec, relative=True,
-                   scheme=DEFAULT_SCHEME, bar_width=2, transparency=0):
+                   scheme=DEFAULT_SCHEME, bar_width=2, transparency=0,
+                   theme=None, limit_prec=False, annotations=None, style=None):
     """Draw a spectrum stick-plot onto a backend (shared by PNG and PDF)."""
-    axis, grey, label = (68, 68, 68), (85, 85, 85), (192, 60, 43)
+    theme = theme or BG_THEMES[DEFAULT_BG]
+    st = {**DEFAULT_STYLE, **(style or {})}
+    axis, grey, label = theme["axis"], theme["text"], theme["label"]
+    be.fill_bg(theme["bg"])
     pad_l, pad_r, pad_t, pad_b = 90, 30, 55, 70
     x0, y0 = pad_l, pad_t
     x1, y1 = width - pad_r, height - pad_b
+    # scale on-screen font-size settings up to the (larger) export canvas
+    sf = width / 900.0
 
-    title = spec.name if spec.name != "(unnamed)" else \
-        f"{spec.source} #{spec.num}"
-    prec = spec.precursor
-    if prec:
-        title += f"    precursor m/z {prec}"
-    be.text(x0, 20, title, (17, 17, 17), size=22, anchor="lm")
+    def fs(v, floor=6):
+        return max(floor, int(round(v * sf)))
+
+    def col(custom, default_rgb):
+        return _hex_to_rgb(custom) if custom else default_rgb
 
     be.line(x0, y1, x1, y1, axis, 1)
     be.line(x0, y0, x0, y1, axis, 1)
 
+    def draw_annotations():
+        for a in (annotations or []):
+            val = _annotation_value(spec, a["field"])
+            text = f"{a['field']}: {val}" if a.get("show_field") else val
+            if not text.strip():
+                continue
+            size = max(8, int(a["size"] * width / 900.0))
+            be.text(a["fx"] * width, a["fy"] * height, text,
+                    col(a.get("color", ""), theme["title"]),
+                    size=size, anchor="cm",
+                    bold=a.get("bold", False), italic=a.get("italic", False))
+
     peaks = spec.peaks or []
     if not peaks:
-        be.text((x0 + x1) / 2, (y0 + y1) / 2, "No peaks", (150, 150, 150),
+        be.text((x0 + x1) / 2, (y0 + y1) / 2, "No peaks", grey,
                 size=15, anchor="cm")
+        draw_annotations()
         return
 
     mzs = [p[0] for p in peaks]
     lo, hi = min(mzs), max(mzs)
+    pf = _prec_float(spec)
+    if limit_prec and pf is not None:      # cap at precursor + 5 m/z
+        hi = min(hi, pf + 5.0)
     span = max(hi - lo, 1.0)
     vmin, vmax = lo - span * 0.03, hi + span * 0.03
-    base = max((it for _, it in peaks), default=1.0) or 1.0
+    draw = [(mz, it) for (mz, it) in peaks if vmin <= mz <= vmax]
+    if not draw:
+        draw = peaks
+    base = max((it for _, it in draw), default=1.0) or 1.0
 
     def mz2x(mz):
         return x0 + (mz - vmin) / (vmax - vmin) * (x1 - x0)
 
-    for i in range(6):
-        frac = i / 5.0
-        y = y1 - frac * (y1 - y0)
-        be.line(x0 - 5, y, x0, y, axis, 1)
-        lab = f"{frac * 100:.0f}%" if relative else _fmt_si(frac * base)
-        be.text(x0 - 10, y, lab, grey, size=14, anchor="rm")
+    if st["show_yticks"]:
+        for i in range(6):
+            frac = i / 5.0
+            y = y1 - frac * (y1 - y0)
+            be.line(x0 - 5, y, x0, y, axis, 1)
+            lab = f"{frac * 100:.0f}%" if relative else _fmt_si(frac * base)
+            be.text(x0 - 10, y, lab, col(st["tick_color"], grey),
+                    size=fs(st["axis_fontsize"]), anchor="rm",
+                    bold=st["tick_bold"], italic=st["tick_italic"])
 
-    step = _nice_step((vmax - vmin) / 8.0)
-    v = (int(vmin / step) + 1) * step
-    while v < vmax:
-        x = mz2x(v)
-        be.line(x, y1, x, y1 + 5, axis, 1)
-        be.text(x, y1 + 8, f"{v:g}", grey, size=14, anchor="ct")
-        v += step
-    be.text((x0 + x1) / 2, y1 + 42, "m/z", grey, size=15, anchor="ct")
-    be.text(24, (y0 + y1) / 2,
-            "Relative intensity" if relative else "Intensity",
-            grey, size=14, anchor="cm", rotate=90)
+    if st["show_xticks"]:
+        step = _nice_step((vmax - vmin) / 8.0)
+        v = (int(vmin / step) + 1) * step
+        while v < vmax:
+            x = mz2x(v)
+            be.line(x, y1, x, y1 + 5, axis, 1)
+            be.text(x, y1 + 8, f"{v:g}", col(st["tick_color"], grey),
+                    size=fs(st["axis_fontsize"]), anchor="ct",
+                    bold=st["tick_bold"], italic=st["tick_italic"])
+            v += step
+    if st["show_titles"]:
+        xt = st["xtitle"] or "m/z"
+        yt = st["ytitle"] or ("Relative intensity" if relative
+                              else "Intensity")
+        be.text((x0 + x1) / 2, y1 + 42, xt, col(st["xtitle_color"], grey),
+                size=fs(st["xtitle_fontsize"]), anchor="ct",
+                bold=st["xtitle_bold"], italic=st["xtitle_italic"])
+        be.text(24, (y0 + y1) / 2, yt, col(st["ytitle_color"], grey),
+                size=fs(st["ytitle_fontsize"]), anchor="cm", rotate=90,
+                bold=st["ytitle_bold"], italic=st["ytitle_italic"])
 
-    for mz, it in peaks:
+    for mz, it in draw:
         x = mz2x(mz)
         frac = it / base
         y = y1 - frac * (y1 - y0)
@@ -1446,34 +2153,55 @@ def _draw_spectrum(be, width, height, spec, relative=True,
                 _blend_white(scheme_color(scheme, frac), transparency),
                 bar_width)
 
-    for mz, it in sorted(peaks, key=lambda p: p[1], reverse=True)[:10]:
-        x = mz2x(mz)
-        y = y1 - (it / base) * (y1 - y0)
-        be.text(x, y - 6, f"{mz:.4f}".rstrip("0").rstrip("."),
-                label, size=14, anchor="cb")
+    if st["show_peaklabels"]:
+        gap = max(40.0, (x1 - x0) / 22.0)
+        placed = []
+        for mz, it in sorted(draw, key=lambda p: p[1], reverse=True):
+            x = mz2x(mz)
+            if st["peaklabel_auto"]:
+                if any(abs(x - px) < gap for px in placed):
+                    continue
+            elif len(placed) >= max(0, st["peaklabel_n"]):
+                break
+            placed.append(x)
+            y = y1 - (it / base) * (y1 - y0)
+            be.text(x, y - 6, f"{mz:.4f}".rstrip("0").rstrip("."),
+                    col(st["peaklabel_color"], label),
+                    size=fs(st["peaklabel_fontsize"]), anchor="cb",
+                    bold=st["peaklabel_bold"], italic=st["peaklabel_italic"])
+
+    draw_annotations()
 
 
 def render_spectrum_image(spec, relative=True, width=1200, height=700,
-                          scheme=DEFAULT_SCHEME, bar_width=2, transparency=0):
+                          scheme=DEFAULT_SCHEME, bar_width=2, transparency=0,
+                          bg=DEFAULT_BG, limit_prec=False, annotations=None,
+                          style=None):
     """Render a spectrum stick-plot to a PIL RGB image (raster)."""
+    theme = BG_THEMES.get(bg, BG_THEMES[DEFAULT_BG])
     be = _PILBackend(width, height)
     _draw_spectrum(be, width, height, spec, relative, scheme,
-                   bar_width, transparency)
+                   bar_width, transparency, theme, limit_prec,
+                   annotations, style)
     return be.img
 
 
 def save_spectra_pdf(specs, path, relative=True, scheme=DEFAULT_SCHEME,
-                     width=1200, height=700, bar_width=2, transparency=0):
+                     width=1200, height=700, bar_width=2, transparency=0,
+                     bg=DEFAULT_BG, limit_prec=False, annotations=None,
+                     style=None):
     """Write one or more spectra to a multi-page vector PDF.
 
     Text is embedded as Arial (Latin) / Microsoft YaHei (CJK) subsets.
     """
+    theme = BG_THEMES.get(bg, BG_THEMES[DEFAULT_BG])
     be = _make_pdf_backend(path, width, height)
     for i, s in enumerate(specs):
         if i > 0:
             be.new_page()
         _draw_spectrum(be, width, height, s, relative, scheme,
-                       bar_width, transparency)
+                       bar_width, transparency, theme, limit_prec,
+                       annotations, style)
     be.save()
 
 
@@ -1525,6 +2253,8 @@ class App(_TkBase):
         self.scheme_name = tk.StringVar(value=DEFAULT_SCHEME)
         self.bar_width = tk.IntVar(value=2)          # stick thickness (px)
         self.bar_trans = tk.IntVar(value=0)          # transparency % (0=opaque)
+        self.bg_scheme = tk.StringVar(value=DEFAULT_BG)   # plot background
+        self.limit_prec_var = tk.BooleanVar(value=True)   # peaks <= prec + 5
 
         self._build_ui()
         self._build_menu()
@@ -1532,6 +2262,8 @@ class App(_TkBase):
 
         self.plot.set_scheme(self.scheme_name.get())
         self.plot.set_bar_style(self.bar_width.get(), self.bar_trans.get())
+        self.plot.set_bg_theme(self.bg_scheme.get())
+        self.plot.limit_prec = self.limit_prec_var.get()
         self.plot.on_context = self._plot_context_menu
 
         if initial_files:
@@ -1607,14 +2339,38 @@ class App(_TkBase):
         setmenu.add_cascade(label="Peak colour", menu=colormenu)
         setmenu.add_command(label="Bar style (thickness / transparency)…",
                             command=self.edit_bar_style)
+        bgmenu = tk.Menu(setmenu, tearoff=0)
+        for name in BG_THEMES:
+            bgmenu.add_radiobutton(label=name, value=name,
+                                   variable=self.bg_scheme,
+                                   command=self._on_bg_change)
+        setmenu.add_cascade(label="Plot background", menu=bgmenu)
         setmenu.add_separator()
         setmenu.add_checkbutton(
             label="Show relative intensity (%)  (else absolute)",
             variable=self.relative_var, command=self._toggle_relative)
+        setmenu.add_checkbutton(
+            label="Show only peaks ≤ precursor + 5 m/z",
+            variable=self.limit_prec_var, command=self._on_limit_change)
         setmenu.add_separator()
         setmenu.add_command(label="Metadata fields to show…",
                             command=self.choose_meta_fields)
         menubar.add_cascade(label="Settings", menu=setmenu)
+
+        # -- Plot menu: metadata labels on the figure + axis styling --
+        plotmenu = tk.Menu(menubar, tearoff=0)
+        lblmenu = tk.Menu(plotmenu, tearoff=0)
+        lblmenu.add_command(label="Add label…", command=self.add_label_dialog)
+        lblmenu.add_command(label="Clear all labels",
+                            command=lambda: self.plot.clear_annotations())
+        lblmenu.add_separator()
+        lblmenu.add_command(
+            label="On the plot: drag = move · wheel = resize · "
+                  "right-click = edit/delete", state="disabled")
+        plotmenu.add_cascade(label="Metadata labels", menu=lblmenu)
+        plotmenu.add_command(label="Axes & tick labels…",
+                             command=self.edit_axis_style)
+        menubar.add_cascade(label="Plot", menu=plotmenu)
 
         self.config(menu=menubar)
         self.bind("<Control-o>", lambda e: self.open_dialog())
@@ -1623,6 +2379,164 @@ class App(_TkBase):
 
     def _on_scheme_change(self):
         self.plot.set_scheme(self.scheme_name.get())
+
+    def _on_bg_change(self):
+        self.plot.set_bg_theme(self.bg_scheme.get())
+
+    def _on_limit_change(self):
+        self.plot.set_limit_prec(self.limit_prec_var.get())
+
+    def add_label_dialog(self):
+        """Add a draggable metadata label to the plot."""
+        fields = ["Name"] + [f for f in self._all_meta_fields()
+                             if f not in ("# peaks", "source file", "Name")]
+        dlg = tk.Toplevel(self)
+        dlg.title("Add label")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Metadata field:").grid(row=0, column=0,
+                                                    sticky="w", padx=10,
+                                                    pady=(12, 4))
+        fvar = tk.StringVar(value=fields[0])
+        ttk.Combobox(dlg, textvariable=fvar, values=fields, width=26,
+                     state="readonly").grid(row=0, column=1, padx=(0, 10),
+                                            pady=(12, 4))
+        mode = tk.StringVar(value="value")
+        ttk.Radiobutton(dlg, text="Value only", value="value",
+                        variable=mode).grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(dlg, text="Field: value", value="field",
+                        variable=mode).grid(row=2, column=1, sticky="w")
+        btns = ttk.Frame(dlg)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=10,
+                  pady=(8, 12))
+
+        def add():
+            self.plot.add_annotation(fvar.get(),
+                                     show_field=(mode.get() == "field"))
+            dlg.destroy()
+        ttk.Button(btns, text="Add", command=add).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(
+            side="right", padx=(0, 6))
+
+    def edit_axis_style(self):
+        """Edit axis ticks / titles / peak labels: show, content & size."""
+        p = self.plot
+        dlg = tk.Toplevel(self)
+        dlg.title("Axes & tick labels")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        v_xt = tk.BooleanVar(value=p.show_xticks)
+        v_yt = tk.BooleanVar(value=p.show_yticks)
+        v_ti = tk.BooleanVar(value=p.show_titles)
+        v_pl = tk.BooleanVar(value=p.show_peaklabels)
+        v_auto = tk.BooleanVar(value=p.peaklabel_auto)
+        n_pl = tk.IntVar(value=p.peaklabel_n)
+        f_ax = tk.IntVar(value=p.axis_fontsize)
+        f_xti = tk.IntVar(value=p.xtitle_fontsize)
+        f_yti = tk.IntVar(value=p.ytitle_fontsize)
+        f_pl = tk.IntVar(value=p.peaklabel_fontsize)
+        xt = tk.StringVar(value=p.xtitle)
+        yt = tk.StringVar(value=p.ytitle)
+        b_tk = tk.BooleanVar(value=p.tick_bold)
+        i_tk = tk.BooleanVar(value=p.tick_italic)
+        b_xti = tk.BooleanVar(value=p.xtitle_bold)
+        i_xti = tk.BooleanVar(value=p.xtitle_italic)
+        b_yti = tk.BooleanVar(value=p.ytitle_bold)
+        i_yti = tk.BooleanVar(value=p.ytitle_italic)
+        b_pl = tk.BooleanVar(value=p.peaklabel_bold)
+        i_pl = tk.BooleanVar(value=p.peaklabel_italic)
+        c_tk = tk.StringVar(value=p.tick_color)
+        c_xti = tk.StringVar(value=p.xtitle_color)
+        c_yti = tk.StringVar(value=p.ytitle_color)
+        c_pl = tk.StringVar(value=p.peaklabel_color)
+
+        def apply(*_a):
+            p.set_axis_style(
+                show_xticks=v_xt.get(), show_yticks=v_yt.get(),
+                show_titles=v_ti.get(), show_peaklabels=v_pl.get(),
+                peaklabel_auto=v_auto.get(), peaklabel_n=n_pl.get(),
+                axis_fontsize=max(5, f_ax.get()),
+                xtitle_fontsize=max(5, f_xti.get()),
+                ytitle_fontsize=max(5, f_yti.get()),
+                peaklabel_fontsize=max(5, f_pl.get()),
+                xtitle=xt.get(), ytitle=yt.get(),
+                tick_bold=b_tk.get(), tick_italic=i_tk.get(),
+                xtitle_bold=b_xti.get(), xtitle_italic=i_xti.get(),
+                ytitle_bold=b_yti.get(), ytitle_italic=i_yti.get(),
+                peaklabel_bold=b_pl.get(), peaklabel_italic=i_pl.get(),
+                tick_color=c_tk.get(), xtitle_color=c_xti.get(),
+                ytitle_color=c_yti.get(), peaklabel_color=c_pl.get())
+
+        pad = dict(padx=12, pady=2)
+        ttk.Label(dlg, text="Show:", font=("Arial", 9, "bold")).pack(
+            anchor="w", padx=12, pady=(12, 2))
+        ttk.Checkbutton(dlg, text="X-axis tick labels", variable=v_xt,
+                        command=apply).pack(anchor="w", **pad)
+        ttk.Checkbutton(dlg, text="Y-axis tick labels", variable=v_yt,
+                        command=apply).pack(anchor="w", **pad)
+        ttk.Checkbutton(dlg, text="Axis titles", variable=v_ti,
+                        command=apply).pack(anchor="w", **pad)
+        ttk.Checkbutton(dlg, text="Peak m/z labels", variable=v_pl,
+                        command=apply).pack(anchor="w", **pad)
+
+        ttk.Separator(dlg).pack(fill="x", padx=10, pady=6)
+        ttk.Label(dlg, text="Axis titles (blank = default):",
+                  font=("Arial", 9, "bold")).pack(anchor="w", padx=12)
+        for lab, var in (("X title", xt), ("Y title", yt)):
+            row = ttk.Frame(dlg)
+            row.pack(anchor="w", **pad)
+            ttk.Label(row, text=lab, width=7).pack(side="left")
+            e = ttk.Entry(row, textvariable=var, width=26)
+            e.pack(side="left")
+            e.bind("<KeyRelease>", apply)
+
+        ttk.Separator(dlg).pack(fill="x", padx=10, pady=6)
+        ttk.Label(dlg, text="Sizes & counts:",
+                  font=("Arial", 9, "bold")).pack(anchor="w", padx=12)
+        for lab, var, lo, hi in (("Tick font", f_ax, 5, 20),
+                                 ("X-title font", f_xti, 5, 24),
+                                 ("Y-title font", f_yti, 5, 24),
+                                 ("Peak-label font", f_pl, 5, 20)):
+            row = ttk.Frame(dlg)
+            row.pack(anchor="w", **pad)
+            ttk.Label(row, text=lab, width=15).pack(side="left")
+            tk.Scale(row, from_=lo, to=hi, orient="horizontal", length=140,
+                     variable=var, command=apply).pack(side="left")
+        ttk.Checkbutton(dlg, text="Peak labels: auto count (by spacing)",
+                        variable=v_auto, command=apply).pack(anchor="w", **pad)
+        row = ttk.Frame(dlg)
+        row.pack(anchor="w", **pad)
+        ttk.Label(row, text="…or fixed count", width=15).pack(side="left")
+        tk.Scale(row, from_=0, to=40, orient="horizontal", length=140,
+                 variable=n_pl, command=apply).pack(side="left")
+
+        ttk.Separator(dlg).pack(fill="x", padx=10, pady=6)
+        ttk.Label(dlg, text="Bold / Italic:",
+                  font=("Arial", 9, "bold")).pack(anchor="w", padx=12)
+        for lab, bv, iv in (("Tick labels", b_tk, i_tk),
+                            ("X title", b_xti, i_xti),
+                            ("Y title", b_yti, i_yti),
+                            ("Peak labels", b_pl, i_pl)):
+            row = ttk.Frame(dlg)
+            row.pack(anchor="w", **pad)
+            ttk.Label(row, text=lab, width=12).pack(side="left")
+            ttk.Checkbutton(row, text="Bold", variable=bv,
+                            command=apply).pack(side="left")
+            ttk.Checkbutton(row, text="Italic", variable=iv,
+                            command=apply).pack(side="left", padx=(8, 0))
+
+        ttk.Separator(dlg).pack(fill="x", padx=10, pady=6)
+        ttk.Label(dlg, text="Colours (Default = follow background):",
+                  font=("Arial", 9, "bold")).pack(anchor="w", padx=12)
+        th = p.theme
+        for lab, var, dflt in (("Tick labels", c_tk, th["text"]),
+                               ("X title", c_xti, th["text"]),
+                               ("Y title", c_yti, th["text"]),
+                               ("Peak labels", c_pl, th["label"])):
+            _color_row(dlg, lab, var, dflt, self._pick_color, apply).pack(
+                anchor="w", **pad)
+        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(
+            anchor="e", padx=12, pady=(6, 12))
 
     def copy_peaks(self):
         """Copy the current spectrum's peaks to the clipboard as two columns.
@@ -1671,13 +2585,17 @@ class App(_TkBase):
         ttk.Button(dlg, text="Close", command=dlg.destroy).grid(
             row=3, column=1, sticky="e", padx=(4, 10), pady=(6, 12))
 
-    def _ask_image_size(self):
-        """Ask for export image size: current preview, or a custom W×H.
+    def _ask_image_size(self, specs=None):
+        """Ask for export image size (current or custom W×H) with a live preview.
 
         Returns (width, height) or None if cancelled.
         """
+        from PIL import ImageTk
         pw = max(int(self.plot.winfo_width()), 100)
         ph = max(int(self.plot.winfo_height()), 100)
+        spec = (specs or [getattr(self, "_current_spec", None)])[0]
+        params = self._export_params()
+
         dlg = tk.Toplevel(self)
         dlg.title("Image size")
         dlg.transient(self)
@@ -1687,36 +2605,92 @@ class App(_TkBase):
         wv = tk.StringVar(value="1200")
         hv = tk.StringVar(value="700")
 
-        ttk.Radiobutton(dlg, text=f"Current preview size ({pw} × {ph})",
+        left = ttk.Frame(dlg)
+        left.pack(side="left", padx=12, pady=12, anchor="n")
+        ttk.Radiobutton(left, text=f"Current preview size ({pw} × {ph})",
                         value="preview", variable=mode).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(12, 2))
-        ttk.Radiobutton(dlg, text="Custom size:", value="custom",
-                        variable=mode).grid(row=1, column=0, sticky="w",
-                                            padx=10)
-        ttk.Entry(dlg, textvariable=wv, width=7).grid(row=1, column=1)
-        ttk.Label(dlg, text="×").grid(row=1, column=2)
-        ttk.Entry(dlg, textvariable=hv, width=7).grid(row=1, column=3,
-                                                      padx=(0, 10))
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Radiobutton(left, text="Custom size:", value="custom",
+                        variable=mode).grid(row=1, column=0, sticky="w")
+        ttk.Entry(left, textvariable=wv, width=7).grid(row=1, column=1)
+        ttk.Label(left, text="×").grid(row=1, column=2)
+        ttk.Entry(left, textvariable=hv, width=7).grid(row=2, column=1,
+                                                       sticky="w")
+
+        preview = ttk.Frame(dlg)
+        preview.pack(side="left", padx=(0, 12), pady=12)
+        ttk.Label(preview, text="Preview", foreground="#888").pack()
+        prev_cv = tk.Canvas(preview, width=400, height=250,
+                            background="#fafafa", highlightthickness=1,
+                            highlightbackground="#ccc")
+        prev_cv.pack()
+
+        def chosen():
+            if mode.get() == "preview":
+                return (pw, ph)
+            w, h = _to_float(wv.get()), _to_float(hv.get())
+            if w and h and w >= 50 and h >= 50:
+                return (int(w), int(h))
+            return None
+
+        def show_msg(msg):
+            prev_cv.delete("all")
+            prev_cv.create_text(200, 125, text=msg, fill="#999",
+                                font=("Arial", 10))
+
+        def update_preview():
+            sz = chosen()
+            if sz is None or spec is None:
+                show_msg("(enter width & height)")
+                return
+            w, h = sz
+            try:
+                img = render_spectrum_image(spec, width=w, height=h, **params)
+            except Exception:  # noqa: BLE001
+                show_msg("(cannot render)")
+                return
+            img.thumbnail((392, 242))
+            self._size_preview_photo = ImageTk.PhotoImage(img)
+            prev_cv.delete("all")
+            prev_cv.create_image(200, 125, image=self._size_preview_photo,
+                                 anchor="center")
+            prev_cv.create_text(200, 244, text=f"{w} × {h} px", fill="#888",
+                                font=("Arial", 8), anchor="s")
+
+        after = {"id": None}
+
+        def schedule(*_a):
+            if after["id"]:
+                try:
+                    dlg.after_cancel(after["id"])
+                except Exception:  # noqa: BLE001
+                    pass
+            after["id"] = dlg.after(250, update_preview)
+
+        for var in (wv, hv, mode):
+            var.trace_add("write", schedule)
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=2, column=0, columnspan=4, sticky="e", padx=10,
-                  pady=(8, 12))
+        btns.pack(side="bottom", anchor="e", padx=12, pady=(0, 12))
 
         def ok():
-            if mode.get() == "preview":
-                result["size"] = (pw, ph)
-            else:
-                w = _to_float(wv.get())
-                h = _to_float(hv.get())
-                if not w or not h or w < 50 or h < 50:
-                    self._alert("Image size", "Enter valid width and height "
-                                              "(≥ 50 px).")
-                    return
-                result["size"] = (int(w), int(h))
+            sz = chosen()
+            if sz is None:
+                self._alert("Image size", "Enter valid width and height "
+                                          "(≥ 50 px).")
+                return
+            result["size"] = sz
             dlg.destroy()
         ttk.Button(btns, text="OK", command=ok).pack(side="right")
         ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(
             side="right", padx=(0, 6))
+
+        dlg.update_idletasks()
+        root = self.winfo_toplevel()
+        x = root.winfo_rootx() + (root.winfo_width() - dlg.winfo_width()) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        update_preview()
         dlg.grab_set()
         dlg.wait_window()
         return result["size"]
@@ -2107,28 +3081,32 @@ class App(_TkBase):
         self.mz_enable = tk.BooleanVar(value=False)
         ttk.Checkbutton(row3, text="m/z filter",
                         variable=self.mz_enable).pack(side="left")
-        self.mz_enable.trace_add("write", lambda *a: self.apply_filter())
+        self.mz_enable.trace_add("write", lambda *a: self._on_mz_enable())
+
+        # all options live in a frame that is only shown while enabled
+        self.mz_options = ttk.Frame(row3)
+        opt = self.mz_options
 
         # target m/z (typed directly, or computed from formula+adduct)
         self.mz_target = tk.StringVar()
         self.mz_target.trace_add("write", lambda *a: self._on_mz_filter_change())
-        ttk.Label(row3, text="m/z").pack(side="left", padx=(8, 2))
-        ttk.Entry(row3, textvariable=self.mz_target, width=12).pack(side="left")
+        ttk.Label(opt, text="m/z").pack(side="left", padx=(8, 2))
+        ttk.Entry(opt, textvariable=self.mz_target, width=12).pack(side="left")
 
-        ttk.Label(row3, text="±").pack(side="left", padx=(6, 2))
+        ttk.Label(opt, text="±").pack(side="left", padx=(6, 2))
         self.mz_tol = tk.StringVar(value="10")
         self.mz_tol.trace_add("write", lambda *a: self._on_mz_filter_change())
-        ttk.Entry(row3, textvariable=self.mz_tol, width=7).pack(side="left")
+        ttk.Entry(opt, textvariable=self.mz_tol, width=7).pack(side="left")
         self.mz_tol_unit = tk.StringVar(value="ppm")
-        ttk.Combobox(row3, textvariable=self.mz_tol_unit, width=5,
+        ttk.Combobox(opt, textvariable=self.mz_tol_unit, width=5,
                      state="readonly", values=["ppm", "Da"]).pack(
             side="left", padx=(2, 8))
         self.mz_tol_unit.trace_add("write",
                                    lambda *a: self._on_mz_filter_change())
 
-        ttk.Label(row3, text="match").pack(side="left")
+        ttk.Label(opt, text="match").pack(side="left")
         self.mz_target_kind = tk.StringVar(value="precursor")
-        ttk.Combobox(row3, textvariable=self.mz_target_kind, width=10,
+        ttk.Combobox(opt, textvariable=self.mz_target_kind, width=10,
                      state="readonly",
                      values=["precursor", "any peak"]).pack(side="left",
                                                             padx=(4, 12))
@@ -2136,21 +3114,21 @@ class App(_TkBase):
                                       lambda *a: self._on_mz_filter_change())
 
         # formula (+ extra mass) + adduct -> computes the m/z above
-        ttk.Label(row3, text="Formula").pack(side="left")
+        ttk.Label(opt, text="Formula").pack(side="left")
         self.mz_formula = tk.StringVar()
         self.mz_formula.trace_add("write", lambda *a: self._compute_mz())
-        ttk.Entry(row3, textvariable=self.mz_formula, width=14).pack(
+        ttk.Entry(opt, textvariable=self.mz_formula, width=14).pack(
             side="left", padx=(4, 4))
-        ttk.Label(row3, text="+Δmass").pack(side="left")
+        ttk.Label(opt, text="+Δmass").pack(side="left")
         self.mz_extra = tk.StringVar()
         self.mz_extra.trace_add("write", lambda *a: self._compute_mz())
-        ttk.Entry(row3, textvariable=self.mz_extra, width=9).pack(
+        ttk.Entry(opt, textvariable=self.mz_extra, width=9).pack(
             side="left", padx=(4, 8))
-        ttk.Label(row3, text="Adduct").pack(side="left")
+        ttk.Label(opt, text="Adduct").pack(side="left")
         self.mz_adduct = tk.StringVar(value="[M+H]+")
-        ttk.Combobox(row3, textvariable=self.mz_adduct, width=13,
-                     state="readonly", values=list(ADDUCTS.keys())).pack(
-            side="left", padx=(4, 0))
+        # editable → custom adducts like [2M+H]+, [M+2NH4]2+ can be typed in
+        ttk.Combobox(opt, textvariable=self.mz_adduct, width=14,
+                     values=ADDUCT_PRESETS).pack(side="left", padx=(4, 0))
         self.mz_adduct.trace_add("write", lambda *a: self._compute_mz())
 
         # main paned area
@@ -2182,8 +3160,9 @@ class App(_TkBase):
         self.plot = SpectrumPlot(plot_frame, width=600, height=360)
         self.plot.pack(fill="both", expand=True)
         hint = ttk.Label(plot_frame,
-                         text="Drag = zoom range   •   Wheel = zoom   •   "
-                              "Right-click = menu   •   Hover = peak info",
+                         text="Drag = zoom box (x/y)   •   Wheel = zoom "
+                              "(y over axis)   •   Double-click = reset "
+                              "(axis or all)   •   Right-click = menu",
                          foreground="#888")
         hint.pack(side="bottom", anchor="w", padx=4, pady=2)
         right.add(plot_frame, weight=3)
@@ -2666,6 +3645,14 @@ class App(_TkBase):
     def _on_mz_filter_change(self):
         self.schedule_filter()
 
+    def _on_mz_enable(self):
+        # show the options only while the filter is enabled
+        if self.mz_enable.get():
+            self.mz_options.pack(side="left")
+        else:
+            self.mz_options.pack_forget()
+        self.apply_filter()
+
     def _mz_filter_bounds(self):
         """Return (low, high) m/z window if the filter is active, else None."""
         if not self.mz_enable.get():
@@ -2813,6 +3800,37 @@ class App(_TkBase):
         self.status.config(
             text=f"Saved {len(specs)} spectra to {os.path.basename(path)}")
 
+    def _export_params(self):
+        """Render kwargs shared by the export functions and the size preview."""
+        return dict(
+            relative=self.relative_var.get(), scheme=self.scheme_name.get(),
+            bar_width=self.bar_width.get(), transparency=self.bar_trans.get(),
+            bg=self.bg_scheme.get(), limit_prec=self.limit_prec_var.get(),
+            annotations=[dict(a) for a in self.plot.annotations],
+            style=dict(show_xticks=self.plot.show_xticks,
+                       show_yticks=self.plot.show_yticks,
+                       show_titles=self.plot.show_titles,
+                       show_peaklabels=self.plot.show_peaklabels,
+                       peaklabel_auto=self.plot.peaklabel_auto,
+                       peaklabel_n=self.plot.peaklabel_n,
+                       xtitle=self.plot.xtitle, ytitle=self.plot.ytitle,
+                       axis_fontsize=self.plot.axis_fontsize,
+                       xtitle_fontsize=self.plot.xtitle_fontsize,
+                       ytitle_fontsize=self.plot.ytitle_fontsize,
+                       peaklabel_fontsize=self.plot.peaklabel_fontsize,
+                       tick_bold=self.plot.tick_bold,
+                       tick_italic=self.plot.tick_italic,
+                       xtitle_bold=self.plot.xtitle_bold,
+                       xtitle_italic=self.plot.xtitle_italic,
+                       ytitle_bold=self.plot.ytitle_bold,
+                       ytitle_italic=self.plot.ytitle_italic,
+                       peaklabel_bold=self.plot.peaklabel_bold,
+                       peaklabel_italic=self.plot.peaklabel_italic,
+                       tick_color=self.plot.tick_color,
+                       xtitle_color=self.plot.xtitle_color,
+                       ytitle_color=self.plot.ytitle_color,
+                       peaklabel_color=self.plot.peaklabel_color))
+
     def save_image(self, fmt, specs=None):
         if specs is None:
             specs = self._selected_spectra()
@@ -2820,7 +3838,7 @@ class App(_TkBase):
             self._alert("Nothing to save",
                         "Load and select at least one spectrum first.")
             return
-        size = self._ask_image_size()
+        size = self._ask_image_size(specs)
         if size is None:
             return
         w, h = size
@@ -2830,26 +3848,21 @@ class App(_TkBase):
             filetypes=[(fmt.upper(), "*" + ext), ("All files", "*.*")])
         if not path:
             return
-        rel = self.relative_var.get()
-        scheme = self.scheme_name.get()
-        bw = self.bar_width.get()
-        tr = self.bar_trans.get()
+        pr = self._export_params()
         try:
             if fmt == "png":
                 if len(specs) == 1:
-                    render_spectrum_image(specs[0], rel, w, h, scheme,
-                                          bw, tr).save(path)
+                    render_spectrum_image(specs[0], width=w, height=h,
+                                          **pr).save(path)
                     n = 1
                 else:
                     stem, _ = os.path.splitext(path)
                     for i, s in enumerate(specs, 1):
-                        render_spectrum_image(s, rel, w, h, scheme,
-                                              bw, tr).save(f"{stem}_{i}.png")
+                        render_spectrum_image(s, width=w, height=h,
+                                              **pr).save(f"{stem}_{i}.png")
                     n = len(specs)
             else:  # pdf — one vector page per spectrum
-                save_spectra_pdf(specs, path, relative=rel, scheme=scheme,
-                                 width=w, height=h, bar_width=bw,
-                                 transparency=tr)
+                save_spectra_pdf(specs, path, width=w, height=h, **pr)
                 n = len(specs)
         except Exception as exc:  # noqa: BLE001
             self._alert("Export error", str(exc))
