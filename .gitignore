@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build artifacts
+build/
+*.spec
+
+# Optional: the packaged executable is large — prefer attaching it to a
+# GitHub Release rather than committing it. Uncomment to ignore it:
+# dist/
